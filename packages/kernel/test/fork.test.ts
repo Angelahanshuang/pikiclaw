@@ -237,6 +237,28 @@ describe('Hub.forkSession', () => {
     expect(driver.anchorCalls).toBe(1);   // consulted only because the recorded anchor was dropped
   });
 
+  it('re-checks the pinned anchor at DISPATCH and seeds when the parent compacted meanwhile', async () => {
+    const driver = new ScriptedDriver('forky', true);
+    const { sessionKey, taskIds } = await seedParent(driver);
+    // Anchor resolves at fork time, so a native fork is pinned…
+    const { sessionKey: forkKey } = await loom.io.forkSession({ fromSessionKey: sessionKey, atTaskId: taskIds[0] });
+    const store = new FsSessionStore(tmp);
+    expect((await store.get('forky', forkKey.split(':')[1]))!.pendingFork!.mode).toBe('native');
+
+    // …then the parent compacts before the branch's first prompt: the pin is now dead. The
+    // dispatch must degrade to a seed instead of failing the whole run on every retry.
+    driver.unresolvableAnchors = new Set(['native-parent/a1']);
+    driver.nextNativeId = 'native-seeded';
+    await loom.io.prompt({ prompt: 'branch question', sessionKey: forkKey });
+    await flushTurns();
+
+    const run = driver.runs.at(-1)!;
+    expect(run.fork ?? null).toBeNull();                    // no doomed --resume-session-at
+    expect(run.sessionId ?? null).toBeNull();               // brand-new native session
+    expect(run.prompt).toContain('User: first question');   // …carrying the copied prefix
+    expect((await store.get('forky', forkKey.split(':')[1]))!.nativeSessionId).toBe('native-seeded');
+  });
+
   it('a fork whose first turn dies without a native session keeps the intent and re-forks', async () => {
     const driver = new ScriptedDriver('forky', true);
     const { sessionKey, taskIds } = await seedParent(driver);

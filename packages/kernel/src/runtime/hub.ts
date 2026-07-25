@@ -304,6 +304,18 @@ export class Hub implements LoomIO {
     // A rewind keeps the SAME native id (it resumes+rebranches this session), so — unlike a fork —
     // it is NOT gated on a missing native id. Fork and rewind never coexist on one record.
     const pendingRewind = rec?.pendingRewind ?? null;
+    // Can this dispatch still take the NATIVE fork path? The anchor pinned at fork time is
+    // re-checked HERE, not only there: the parent can compact in between (a branch pane may sit
+    // unused for minutes before its first prompt, and a failed first turn retries later), and a
+    // stale anchor fails the ENTIRE run at the agent's resume-at flag — which would repeat on
+    // every retry. Unresolvable now → seed-fork this dispatch instead (lower fidelity, but it
+    // runs). Anchor-less native forks (tail cuts) resume the parent's tip and need no check.
+    const forkNative = !!pendingFork && pendingFork.mode === 'native' && !!pendingFork.parentNativeSessionId
+      && (!pendingFork.anchor
+        || await this.anchorStillResolvable(driver, pendingFork.parentNativeSessionId, workdir, pendingFork.anchor));
+    if (pendingFork?.mode === 'native' && !forkNative) {
+      this.deps.log?.(`[hub] fork anchor ${pendingFork.anchor} unresolvable at dispatch — seeding ${sessionKey} instead`);
+    }
     const injection = await this.deps.modelResolver.resolve(agent, { model: input.model, profileId: null }).catch(() => null);
     const model = injection?.model ?? input.model ?? null;
     const effort = input.effort ?? null;
@@ -318,15 +330,15 @@ export class Hub implements LoomIO {
     ]);
     // A seed fork opens a brand-new native session, so it takes the first-turn system prompt;
     // a native fork is resume-shaped (the parent's opening turn already carried it).
-    const systemPrompt = await this.composeSystemPrompt(agent, workdir, !preExisted || pendingFork?.mode === 'seed');
+    const systemPrompt = await this.composeSystemPrompt(agent, workdir, !preExisted || (!!pendingFork && !forkNative));
 
     let driverSessionId = rec?.nativeSessionId || (input.sessionKey ? sessionId : null);
     let driverFork: { anchor?: string | null } | null = null;
     let driverRewind: { anchor?: string | null } | null = null;
     let driverPrompt = input.prompt;
     if (pendingFork) {
-      if (pendingFork.mode === 'native' && pendingFork.parentNativeSessionId) {
-        driverSessionId = pendingFork.parentNativeSessionId;
+      if (forkNative) {
+        driverSessionId = pendingFork.parentNativeSessionId!;
         driverFork = { anchor: pendingFork.anchor };
       } else {
         driverSessionId = null;

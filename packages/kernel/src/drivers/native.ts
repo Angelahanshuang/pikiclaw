@@ -67,6 +67,45 @@ function memoized<T>(cache: Map<string, { mtimeMs: number; size: number; value: 
   return value;
 }
 
+// ---- Last-activity clock ----
+//
+// A transcript's mtime is NOT a trustworthy activity clock. Any maintenance pass the owning CLI runs
+// over its whole store rewrites every mtime at once — claude 2.1.220 backfilled a `last-prompt` resume
+// index into every transcript it had, stamping months of history with one instant. The list order then
+// degenerates into an arbitrary tie and a bounded `limit` cuts the genuinely-recent rows. The records
+// themselves carry the durable clock, so take the newest in-file `timestamp` from a bounded tail slice
+// and order by THAT.
+const ACTIVITY_PROBE_BYTES = [64 * 1024, 1024 * 1024];
+// Matched against raw text rather than parsed lines: the slice starts mid-record and a single base64
+// image record can be megabytes, so parsing the window may legitimately yield no complete line. An
+// occurrence nested inside a string payload is escaped (`\"timestamp\":`) and cannot match.
+const IN_FILE_TIMESTAMP = /"timestamp"\s*:\s*"(\d{4}-\d\d-\d\dT[^"]+)"/g;
+
+const activityCache = new Map<string, { mtimeMs: number; size: number; value: number | null }>();
+
+/**
+ * Newest in-file record timestamp in ms, or null when the transcript carries no usable clock (callers
+ * fall back to mtime). Clamped to mtime — real activity always precedes the last write, so an unescaped
+ * `timestamp` nested in some payload can never push a row above its own file.
+ */
+function readLastActivityMs(filePath: string, stat: fs.Stats): number | null {
+  return memoized(activityCache, filePath, stat, () => {
+    for (const probe of ACTIVITY_PROBE_BYTES) {
+      const length = Math.min(probe, stat.size);
+      let text: string;
+      try { text = readRegion(filePath, stat.size - length, length); } catch { return null; }
+      let newestMs: number | null = null;
+      for (const match of text.matchAll(IN_FILE_TIMESTAMP)) {
+        const ms = Date.parse(match[1]);
+        if (Number.isFinite(ms) && (newestMs === null || ms > newestMs)) newestMs = ms;
+      }
+      if (newestMs !== null) return Math.min(newestMs, stat.mtimeMs);
+      if (length >= stat.size) break; // the whole file was already in the window — nothing to escalate to
+    }
+    return null;
+  });
+}
+
 /** Extract plain text from a Codex `response_item` message content (array of `{type,text}` blocks). */
 function codexText(content: unknown): string {
   if (typeof content === 'string') return content;
@@ -169,18 +208,21 @@ export function discoverClaudeNativeSessions(workdir: string, opts: DiscoverOpti
   try { entries = fs.readdirSync(projectDir, { withFileTypes: true }); } catch { return []; }
   const threshold = opts.runningThresholdMs ?? NATIVE_SESSION_RUNNING_THRESHOLD_MS;
 
-  const files: { sessionId: string; filePath: string; stat: fs.Stats }[] = [];
+  // Ordered by the transcript's own clock, not its mtime (see readLastActivityMs) — the probe is a
+  // small tail read memoized per (mtime,size), so the expensive head+tail meta read below still only
+  // runs for the rows that survive `limit`.
+  const files: { sessionId: string; filePath: string; stat: fs.Stats; activityMs: number }[] = [];
   for (const entry of entries) {
     if (!entry.isFile() || !entry.name.endsWith('.jsonl')) continue;
     const filePath = path.join(projectDir, entry.name);
     const stat = statSafe(filePath);
-    if (stat) files.push({ sessionId: entry.name.slice(0, -6), filePath, stat });
+    if (stat) files.push({ sessionId: entry.name.slice(0, -6), filePath, stat, activityMs: readLastActivityMs(filePath, stat) ?? stat.mtimeMs });
   }
-  files.sort((a, b) => b.stat.mtimeMs - a.stat.mtimeMs);
+  files.sort((a, b) => b.activityMs - a.activityMs);
   const selected = typeof opts.limit === 'number' ? files.slice(0, Math.max(0, opts.limit)) : files;
 
   const now = Date.now();
-  return selected.map(({ sessionId, filePath, stat }) => {
+  return selected.map(({ sessionId, filePath, stat, activityMs }) => {
     const { title, model, preview, turns } = readClaudeMeta(filePath, stat);
     return {
       sessionId,
@@ -189,7 +231,9 @@ export function discoverClaudeNativeSessions(workdir: string, opts: DiscoverOpti
       cwd: path.resolve(workdir),
       model,
       createdAt: stat.birthtime.toISOString(),
-      updatedAt: stat.mtime.toISOString(),
+      updatedAt: new Date(activityMs).toISOString(),
+      // Liveness stays on mtime: any write means the process is alive, even a turn that has gone quiet
+      // mid-tool-call and appended no timestamped record yet.
       running: now - stat.mtimeMs < threshold,
       messageCount: turns || null,
     };

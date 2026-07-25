@@ -69,6 +69,47 @@ describe('workspace/native — discovering an agent\'s own sessions', () => {
     expect(out[0].preview).toBe('done');
   });
 
+  // A CLI maintenance pass over its own store (claude 2.1.220 backfilled a `last-prompt` index record
+  // into every transcript) rewrites every mtime to one instant. Ordering must survive that, or months
+  // of history collapse into an arbitrary tie and `limit` cuts the genuinely-recent rows.
+  it('clocks claude sessions by their in-file timestamps, not a bulk-rewritten mtime', () => {
+    const workdir = path.join(tmp, 'proj');
+    const projDir = path.join(tmp, '.claude', 'projects', encodeClaudeProjectDir(workdir));
+    fs.mkdirSync(projDir, { recursive: true });
+    const transcript = (prompt: string, ts: string) => [
+      JSON.stringify({ type: 'user', isMeta: false, message: { content: prompt }, timestamp: ts }),
+      JSON.stringify({ type: 'assistant', message: { content: [{ type: 'text', text: 'ok' }] }, timestamp: ts }),
+      // the backfilled index record — carries no timestamp of its own
+      JSON.stringify({ type: 'last-prompt', lastPrompt: prompt, sessionId: 'x' }),
+    ].join('\n');
+    fs.writeFileSync(path.join(projDir, 'old.jsonl'), transcript('ancient e2e run', '2026-06-26T04:48:26.181Z'));
+    fs.writeFileSync(path.join(projDir, 'recent.jsonl'), transcript('yesterday real work', '2026-07-24T20:43:00.000Z'));
+    // Both files stamped at the same instant by the migration, oldest LAST so a mtime sort inverts them.
+    const migration = new Date('2026-07-25T07:55:13.000Z');
+    fs.utimesSync(path.join(projDir, 'recent.jsonl'), migration, migration);
+    fs.utimesSync(path.join(projDir, 'old.jsonl'), migration, new Date(migration.getTime() + 1000));
+
+    const out = discoverClaudeNativeSessions(workdir, { home: tmp });
+    expect(out.map((s) => s.sessionId)).toEqual(['recent', 'old']);
+    expect(out[0].updatedAt).toBe('2026-07-24T20:43:00.000Z');
+    expect(out[1].updatedAt).toBe('2026-06-26T04:48:26.181Z');
+    // …and the bounded limit keeps the row that is actually newest.
+    expect(discoverClaudeNativeSessions(workdir, { home: tmp, limit: 1 }).map((s) => s.sessionId)).toEqual(['recent']);
+  });
+
+  it('falls back to mtime when a claude transcript carries no timestamp at all', () => {
+    const workdir = path.join(tmp, 'proj');
+    const projDir = path.join(tmp, '.claude', 'projects', encodeClaudeProjectDir(workdir));
+    fs.mkdirSync(projDir, { recursive: true });
+    const file = path.join(projDir, 'clockless.jsonl');
+    fs.writeFileSync(file, JSON.stringify({ type: 'user', isMeta: false, message: { content: 'no clock here' } }));
+    const when = new Date('2026-07-20T10:00:00.000Z');
+    fs.utimesSync(file, when, when);
+
+    const [row] = discoverClaudeNativeSessions(workdir, { home: tmp });
+    expect(row.updatedAt).toBe('2026-07-20T10:00:00.000Z');
+  });
+
   it('discovers codex native sessions filtered by cwd', () => {
     const workdir = path.join(tmp, 'proj');
     fs.mkdirSync(workdir, { recursive: true });

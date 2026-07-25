@@ -18,6 +18,7 @@ import { ensureManagedSession } from '../src/agent/index.ts';
 import { captureEnv, makeTmpDir, restoreEnv } from './support/env.ts';
 import { makeStreamResult } from './support/stream-result.ts';
 import { createTelegramBotHarness } from './support/telegram-bot-harness.ts';
+import { DEFAULT_AGENT_MODELS } from '../src/core/config/runtime-config.ts';
 
 function createBot() {
   return createTelegramBotHarness();
@@ -298,7 +299,7 @@ describe('TelegramBot', () => {
         agent: 'claude',
         models: [
           { id: 'claude-sonnet-4-6', alias: 'sonnet' },
-          { id: 'claude-opus-4-8', alias: 'opus' },
+          { id: DEFAULT_AGENT_MODELS.claude, alias: 'opus' },
         ],
         sources: ['app-server model/list'],
         note: 'debug note should stay hidden while models exist',
@@ -312,7 +313,7 @@ describe('TelegramBot', () => {
       expect(replies[0]?.text).toContain('debug note should stay hidden while models exist');
       const keyboard = replies[0]?.opts?.keyboard?.inline_keyboard || [];
       expect(keyboard[0]).toEqual([{ text: '— Native —', callback_data: 'mc' }]);
-      expect(keyboard[1]).toEqual([{ text: '● opus', callback_data: 'md:n:claude-opus-4-8' }]);
+      expect(keyboard[1]).toEqual([{ text: '● opus', callback_data: `md:n:${DEFAULT_AGENT_MODELS.claude}` }]);
       expect(keyboard[2]).toEqual([{ text: 'sonnet', callback_data: 'md:n:claude-sonnet-4-6' }]);
       const keyboardJson = JSON.stringify(keyboard);
       expect(keyboardJson).toContain('"callback_data":"ed:high"');

@@ -106,7 +106,11 @@ emit({ type: 'user', message: { role: 'user', content: [{ type: 'tool_result', t
   }, 8000);
 
   it('does NOT stall when the model replies after the tool_result', async () => {
-    process.env.PIKILOOM_CLAUDE_MODEL_STALL_MS = '400';
+    // The window must clear CLI spawn, not just the reply delay: the watchdog now arms at prompt
+    // delivery (the initial model wait), so its countdown starts before the fake binary's first
+    // line is even read. A budget tight enough to expire during spawn fires before the reply lands
+    // and this asserts a stall that production (300s/600s windows) would never see.
+    process.env.PIKILOOM_CLAUDE_MODEL_STALL_MS = '3000';
     const bin = writeFakeClaude(`
 emit({ type: 'assistant', message: { role: 'assistant', content: [{ type: 'tool_use', id: 'toolu_1', name: 'Bash', input: { command: 'grep x a.txt' } }], stop_reason: 'tool_use' } });
 emit({ type: 'user', message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'toolu_1', content: 'match', is_error: false }] } });

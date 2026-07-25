@@ -1,7 +1,8 @@
 import { execSync } from 'node:child_process';
 import path from 'node:path';
 import process from 'node:process';
-import { listModels } from '../src/code-agent.ts';
+import { listModels } from '../src/agent/stream.ts';
+import { DEFAULT_AGENT_MODELS } from '../src/core/config/runtime-config.ts';
 
 function hasCmd(cmd: string): boolean {
   try {
@@ -21,8 +22,8 @@ function getVersion(cmd: string): string | null {
 }
 
 const workdir = path.resolve(process.argv[2] || process.env.PIKILOOM_WORKDIR || process.cwd());
-const claudeCurrentModel = (process.env.CLAUDE_MODEL || 'claude-opus-4-8').trim();
-const codexCurrentModel = (process.env.CODEX_MODEL || 'gpt-5.5').trim();
+const claudeCurrentModel = (process.env.CLAUDE_MODEL || DEFAULT_AGENT_MODELS.claude).trim();
+const codexCurrentModel = (process.env.CODEX_MODEL || DEFAULT_AGENT_MODELS.codex).trim();
 
 const result = {
   generatedAt: new Date().toISOString(),

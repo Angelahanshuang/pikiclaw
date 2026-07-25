@@ -10,7 +10,7 @@ export const CODEX_56_MODEL_IDS = [
 ] as const;
 
 export const DEFAULT_AGENT_MODELS: Record<Agent, string> = {
-  claude: 'claude-opus-4-8',
+  claude: 'claude-opus-5',
   codex: CODEX_56_MODEL_IDS[0],
   gemini: 'gemini-3.1-pro-preview',
   hermes: 'anthropic/claude-sonnet-4',

@@ -110,7 +110,7 @@ const TEMPLATES: ProviderTemplate[] = [
     blurb: { zh: 'Claude 官方 API', en: 'Official Claude API' },
     baseURL: 'https://api.anthropic.com',
     envVar: 'ANTHROPIC_API_KEY',
-    defaultModel: 'claude-sonnet-4-5',
+    defaultModel: 'claude-sonnet-5',
   },
   {
     id: 'google',

@@ -18,7 +18,10 @@ import { resolveAgentInjection } from '../model/injector.js';
 // queue, wire) is live here.
 
 const DEMO_MODELS: Record<string, any[]> = {
-  claude: [{ id: 'claude-opus-4-8', label: 'Opus 4.8', providerName: 'anthropic', contextWindow: 200000 }],
+  claude: [
+    { id: 'claude-opus-5', label: 'Opus 5', providerName: 'anthropic', contextWindow: 1000000 },
+    { id: 'claude-opus-4-8', label: 'Opus 4.8', providerName: 'anthropic', contextWindow: 1000000 },
+  ],
   codex: [
     { id: 'gpt-5.6-sol', label: 'GPT-5.6-Sol', providerName: 'openai', contextWindow: 372000 },
     { id: 'gpt-5.6-terra', label: 'GPT-5.6-Terra', providerName: 'openai', contextWindow: 372000 },

@@ -1801,11 +1801,16 @@ function hydrateSubAgentBlocksFromSidecar(richMsgs: RichMessage[], subAgentsDir:
   }
 }
 
+// The `opus`/`sonnet`/`haiku`/`fable` aliases track the CLI's own alias targets, so `opus`
+// resolves to the current Opus generation (Opus 5). Superseded generations stay selectable by
+// their full id but carry no alias — two entries claiming one alias would render identically
+// in the pickers.
 const CLAUDE_MODELS: ModelInfo[] = [
   { id: 'claude-fable-5', alias: 'fable' },
-  { id: 'claude-opus-4-8', alias: 'opus' },
+  { id: 'claude-opus-5', alias: 'opus' },
   { id: 'claude-sonnet-5', alias: 'sonnet' },
   { id: 'claude-haiku-4-5-20251001', alias: 'haiku' },
+  { id: 'claude-opus-4-8', alias: null },
 ];
 
 const CLAUDE_USAGE_QUERY_TTL_MS = 5 * 60_000;

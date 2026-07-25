@@ -46,6 +46,10 @@ function statSafe(p: string): fs.Stats | null {
 // change moves mtime+size and re-reads, so the cache can never go stale.
 const HEAD_BYTES = 256 * 1024;
 const TAIL_BYTES = 256 * 1024;
+// Anchor resolvability is the one read that must follow a chain rather than a slice, so it gets a
+// far larger (still bounded) window: the active leaf chain reaches back to the last /compact
+// boundary, which sits well inside this for any transcript claude itself can still resume.
+const CHAIN_BYTES = 16 * 1024 * 1024;
 
 /** Read a bounded byte region as UTF-8. A partial leading/trailing line is expected; callers skip unparseable lines. */
 function readRegion(filePath: string, start: number, length: number): string {
@@ -500,6 +504,57 @@ export function claudeTranscriptTailAnchor(workdir: string, sessionId: string, o
     }
   } catch { return null; }
   return anchor;
+}
+
+/**
+ * Claude: can `--resume-session-at <anchor>` still resolve this uuid?
+ *
+ * Claude hydrates only the ACTIVE leaf chain — walk `parentUuid` up from the newest main-chain
+ * record — and a `/compact` re-roots the transcript with a fresh `parentUuid: null` record, so
+ * every uuid written before the last compaction is unreachable even though it is still in the
+ * file. Resuming at one of those fails the whole run ("No message found with message.uuid of:
+ * …"), which for a fork means the branch dies on its first dispatch and never recovers.
+ *
+ * Answers false ONLY when the chain was read intact and the anchor was genuinely absent. An
+ * unreadable or truncated transcript answers true: silently downgrading a healthy native fork to
+ * a seed on an inconclusive read is worse than attempting the native one.
+ */
+export function claudeAnchorResolvable(workdir: string, sessionId: string, anchor: string, opts: DiscoverOptions = {}): boolean {
+  const home = homeOf(opts);
+  const filePath = path.join(home, '.claude', 'projects', encodeClaudeProjectDir(workdir), `${sessionId}.jsonl`);
+  const stat = statSafe(filePath);
+  if (!stat) return true;
+  let text: string;
+  try { text = readRegion(filePath, Math.max(0, stat.size - CHAIN_BYTES), Math.min(CHAIN_BYTES, stat.size)); }
+  catch { return true; }
+
+  // uuid -> parent (null = chain root), plus the newest MAIN-chain record. Sidechains are
+  // subagent transcripts hanging off the main one and are never a resume target.
+  const parentOf = new Map<string, string | null>();
+  let leaf: string | null = null;
+  for (const line of text.split('\n')) {
+    const t = line.trim();
+    if (!t || t[0] !== '{' || !t.includes('"uuid"')) continue;
+    let ev: any;
+    try { ev = JSON.parse(t); } catch { continue; }
+    if (typeof ev.uuid !== 'string' || !ev.uuid) continue;
+    // A compact summary is a chain root by construction today (its own parent is the boundary
+    // marker, itself parentless). Pin it as one anyway, so a future CLI that links across the
+    // boundary — it already records a separate `logicalParentUuid` for exactly that — can't make
+    // this walk report pre-compaction uuids as reachable.
+    const parent = typeof ev.parentUuid === 'string' && ev.parentUuid ? ev.parentUuid : null;
+    parentOf.set(ev.uuid, ev.isCompactSummary ? null : parent);
+    if (ev.isSidechain !== true) leaf = ev.uuid;
+  }
+  if (!leaf) return true;
+
+  for (let cur: string | null = leaf; cur; ) {
+    if (cur === anchor) return true;
+    const parent = parentOf.get(cur);
+    if (parent === undefined) return true;   // region cut mid-chain — inconclusive, so allow it
+    cur = parent;
+  }
+  return false;
 }
 
 /** Codex: the last turn id recorded in the session's rollout. */

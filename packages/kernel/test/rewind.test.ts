@@ -16,8 +16,13 @@ class RewindDriver implements AgentDriver {
   readonly runs: AgentTurnInput[] = [];
   nativeId = 'native-parent';
   turn = 0;
+  /** null = the driver can't judge anchors; otherwise these no longer hydrate. */
+  unresolvable: Set<string> | null = null;
   constructor(readonly id: string, private readonly canRewind: boolean) {}
   get capabilities() { return { steer: false, interact: false, resume: true, tui: false, fork: false, rewind: this.canRewind }; }
+  anchorResolvable(opts: { sessionId: string; workdir: string; anchor: string }): boolean {
+    return this.unresolvable ? !this.unresolvable.has(opts.anchor) : true;
+  }
   async run(input: AgentTurnInput, ctx: DriverContext): Promise<DriverResult> {
     this.runs.push(input);
     ctx.emit({ type: 'session', sessionId: this.nativeId });
@@ -106,6 +111,18 @@ describe('Hub.rewindSession', () => {
     const driver = new RewindDriver('rewindy', true);
     const { sessionKey } = await seedParent(driver);
     await expect(loom.io.rewindSession({ sessionKey, atTaskId: 'nope' })).rejects.toThrow(/not found/);
+  });
+
+  it('rejects an anchor the driver can no longer resolve — WITHOUT truncating first', async () => {
+    const driver = new RewindDriver('rewindy', true);
+    driver.unresolvable = new Set(['native-parent/a1']);   // e.g. behind a /compact boundary
+    const { sessionKey, taskIds } = await seedParent(driver);
+
+    await expect(loom.io.rewindSession({ sessionKey, atTaskId: taskIds[0] })).rejects.toThrow(/no longer resolvable/);
+    // Both turns survive: a rewind that would fail on dispatch must not drop the tip on the way in.
+    const store = new FsSessionStore(tmp);
+    expect((await store.history('rewindy', sessionKey.split(':')[1])).length).toBe(2);
+    expect((await store.get('rewindy', sessionKey.split(':')[1]))!.pendingRewind ?? null).toBeNull();
   });
 
   it('rejects a driver without capabilities.rewind (caller falls back to append/fork)', async () => {

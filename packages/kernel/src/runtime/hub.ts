@@ -158,6 +158,13 @@ export class Hub implements LoomIO {
     // falls back to a seed fork — a tail-anchored native fork there would silently absorb the
     // dropped turns, which is worse than the seed's lower fidelity.
     let anchor = input.anchor ?? kept[kept.length - 1]?.anchor ?? null;
+    // An anchor the agent can no longer resolve is worse than none — claude fails the entire run
+    // at `--resume-session-at`, so the branch would die on its first dispatch with nothing to
+    // retry. Drop it: a tail cut re-pins the parent's current tip below, a mid cut seeds instead.
+    if (anchor && !(await this.anchorStillResolvable(driver, parentNativeId, workdir, anchor))) {
+      this.deps.log?.(`[hub] fork anchor ${anchor} no longer resolvable in ${input.fromSessionKey} — dropping it`);
+      anchor = null;
+    }
     if (!anchor && cutIsTail && driver.resolveNativeAnchor) {
       try { anchor = (await driver.resolveNativeAnchor({ sessionId: parentNativeId, workdir })) ?? null; }
       catch { anchor = null; }
@@ -216,6 +223,12 @@ export class Hub implements LoomIO {
     // the kept turn never recorded one (e.g. a native-only import) — can't rebranch, so refuse.
     const anchor = input.anchor ?? kept[kept.length - 1]?.anchor ?? null;
     if (!anchor) throw new Error(`rewind: no native anchor at ${input.atTaskId} in ${input.sessionKey}`);
+    // …and it must still hydrate. Refuse BEFORE truncating: a rewind that dispatches onto an
+    // anchor the agent rejects would have already dropped the tip from the managed transcript,
+    // losing those turns for a regeneration that then never runs.
+    if (!(await this.anchorStillResolvable(driver, nativeId, rec.workdir || this.deps.workdir, anchor))) {
+      throw new Error(`rewind: native anchor ${anchor} is no longer resolvable in ${input.sessionKey}`);
+    }
 
     // Drop the tip from the managed transcript, then stamp the rewind intent. The native store is
     // untouched here — the next dispatch rebranches it at `anchor` via AgentTurnInput.rewind.
@@ -230,6 +243,28 @@ export class Hub implements LoomIO {
     await this.deps.sessionStore.save(rec);
     this.deps.log?.(`[hub] rewound ${input.sessionKey} to ${input.atTaskId} (anchor ${anchor}, kept ${kept.length}/${turns.length} turns)`);
     return { sessionKey: input.sessionKey };
+  }
+
+  // Is a pinned native anchor still usable as a fork/rewind boundary? Only the driver knows its
+  // agent's hydration rules, and only a proven "no" counts — no probe, or a probe that throws,
+  // keeps the anchor so a driver without this hook behaves exactly as before.
+  private async anchorStillResolvable(driver: AgentDriver, sessionId: string, workdir: string, anchor: string): Promise<boolean> {
+    if (!driver.anchorResolvable) return true;
+    try { return await driver.anchorResolvable({ sessionId, workdir, anchor }); }
+    catch { return true; }
+  }
+
+  // Did this turn actually leave a native session behind? A turn that ran did. A FAILED one may
+  // not have: claude echoes back the `--session-id` it was given even when it rejected the run
+  // before reaching the model (an anchor it can't resolve, an unknown model), and pinning that
+  // phantom id as nativeSessionId makes every later prompt resume a session that does not exist.
+  // So probe the agent's own store; drivers without a probe keep the historical trust.
+  private async nativeSessionLanded(driver: AgentDriver, result: { ok: boolean; sessionId?: string | null }, workdir: string): Promise<boolean> {
+    if (!result.sessionId) return false;
+    if (result.ok) return true;
+    if (!driver.resolveNativeAnchor) return true;
+    try { return !!(await driver.resolveNativeAnchor({ sessionId: result.sessionId, workdir })); }
+    catch { return true; }
   }
 
   private enqueue(item: QueuedItem): void {
@@ -329,10 +364,14 @@ export class Hub implements LoomIO {
 
     runner.run(driver, turnInput, input.prompt, model, effort)
       .then(async (result) => {
-        await this.deps.sessionStore.recordResult(agent, sessionId, result);
-        // The branch materialized natively (recordResult stored its id) — consume the fork
-        // intent. A turn that died before a native id landed keeps it, so the retry re-forks.
-        if (pendingFork && result.sessionId) {
+        // Record the turn — but never pin a nativeSessionId no native session backs (see
+        // nativeSessionLanded). A stillborn fork that pinned one would resume a phantom session on
+        // every later prompt AND lose its fork intent: dead for good, with the branch already
+        // shown to the user. Withholding the id instead keeps the intent, so the retry re-forks.
+        const landed = await this.nativeSessionLanded(driver, result, workdir);
+        await this.deps.sessionStore.recordResult(agent, sessionId, landed ? result : { ...result, sessionId: null });
+        // The branch materialized natively (recordResult stored its id) — consume the fork intent.
+        if (pendingFork && landed) {
           try {
             const settled = await this.deps.sessionStore.get(agent, sessionId);
             if (settled?.pendingFork) { settled.pendingFork = null; await this.deps.sessionStore.save(settled); }
@@ -340,7 +379,12 @@ export class Hub implements LoomIO {
         }
         // A rewind materialized (the turn ran and rebranched the native session) — consume the
         // intent so a normal follow-up prompt appends to the regenerated tip instead of rewinding.
-        if (pendingRewind && result.sessionId) {
+        // A rewind materialized only if its turn actually ran: unlike a fork it resumes THIS
+        // session's own (existing) native id, so "a native session is there" proves nothing.
+        // Keeping the intent on failure costs at most one extra rebranch at the same anchor — an
+        // idempotent no-op — while clearing it early would leave the managed transcript truncated
+        // and the native active path still carrying the dropped tip.
+        if (pendingRewind && result.ok) {
           try {
             const settled = await this.deps.sessionStore.get(agent, sessionId);
             if (settled?.pendingRewind) { settled.pendingRewind = null; await this.deps.sessionStore.save(settled); }

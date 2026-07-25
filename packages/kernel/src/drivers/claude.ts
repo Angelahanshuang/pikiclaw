@@ -5,7 +5,7 @@ import { join } from 'node:path';
 import type { AgentDriver, AgentTurnInput, DriverContext, DriverResult, DriverEvent, TuiInput, TuiSpec, NativeSessionInfo } from '../contracts/driver.js';
 import type { UniversalUsage, UniversalPlan, UniversalSubAgent } from '../protocol/index.js';
 import { ClaudeWarmPool } from './claude-pool.js';
-import { claudeTranscriptTailAnchor, discoverClaudeNativeSessions, encodeClaudeProjectDir } from './native.js';
+import { claudeAnchorResolvable, claudeTranscriptTailAnchor, discoverClaudeNativeSessions, encodeClaudeProjectDir } from './native.js';
 import { attachedFileNote, contextPercent, createLineBuffer, imageMimeForFile, parseJsonLine, sigterm, wireAbort } from './shared.js';
 
 // Real driver: shells the local `claude` CLI in stream-json mode and normalizes its
@@ -434,6 +434,12 @@ export class ClaudeDriver implements AgentDriver {
   // record in its transcript. Pins a tail fork at fork time (see AgentDriver contract).
   resolveNativeAnchor(opts: { sessionId: string; workdir: string }): string | null {
     return claudeTranscriptTailAnchor(opts.workdir, opts.sessionId);
+  }
+
+  // `--resume-session-at` only accepts a record claude still hydrates: the active leaf chain back
+  // to the last /compact boundary (see AgentDriver contract).
+  anchorResolvable(opts: { sessionId: string; workdir: string; anchor: string }): boolean {
+    return claudeAnchorResolvable(opts.workdir, opts.sessionId, opts.anchor);
   }
 }
 

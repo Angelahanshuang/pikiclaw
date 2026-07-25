@@ -141,4 +141,10 @@ export interface AgentDriver {
   // same terms as AgentTurnInput.fork.anchor. Hub.forkSession pins a tail cut with it at
   // fork time, so the branch stays put even if the parent keeps running afterwards.
   resolveNativeAnchor?(opts: { sessionId: string; workdir: string }): string | null | Promise<string | null>;
+  // Optional (fork/rewind-capable drivers): can the agent's own resume path still resolve an
+  // anchor pinned earlier? Claude hydrates only the active leaf chain back to the last /compact
+  // boundary and fails the run outright on anything older, so the kernel drops such an anchor
+  // instead of dispatching a branch that cannot start. Must answer false ONLY when the driver can
+  // prove it — an inconclusive probe answers true, so a fork is never downgraded on a bad read.
+  anchorResolvable?(opts: { sessionId: string; workdir: string; anchor: string }): boolean | Promise<boolean>;
 }

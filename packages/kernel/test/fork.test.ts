@@ -7,7 +7,7 @@ import { FsSessionStore } from '../src/ports/defaults.js';
 import { buildForkSeed } from '../src/runtime/fork.js';
 import { claudeResumeArgs } from '../src/drivers/claude.js';
 import { CodexDriver } from '../src/drivers/codex.js';
-import { claudeTranscriptTailAnchor, codexRolloutTailAnchor } from '../src/drivers/native.js';
+import { claudeAnchorResolvable, claudeTranscriptTailAnchor, codexRolloutTailAnchor } from '../src/drivers/native.js';
 import type { AgentDriver, AgentTurnInput, DriverContext, DriverResult, DriverEvent } from '../src/contracts/driver.js';
 
 const flushTurns = () => new Promise((r) => setTimeout(r, 50));
@@ -19,14 +19,28 @@ class ScriptedDriver implements AgentDriver {
   nextNativeId = 'native-1';
   tailAnchor: string | null = 'tail-anchor';
   anchorCalls = 0;
+  /** Native ids the agent's own store does NOT hold (a run that died before creating one). */
+  readonly missingNative = new Set<string>();
+  /** null = the driver can't judge anchors; otherwise only these hydrate. */
+  unresolvableAnchors: Set<string> | null = null;
+  /** Next run reports a hard pre-flight failure — echoing back the id it was handed, as claude does. */
+  failNext = false;
   constructor(readonly id: string, private readonly forky: boolean) {}
-  get capabilities() { return { steer: false, interact: false, resume: true, tui: false, fork: this.forky }; }
-  resolveNativeAnchor(_opts: { sessionId: string; workdir: string }): string | null {
+  get capabilities() { return { steer: false, interact: false, resume: true, tui: false, fork: this.forky, rewind: this.forky }; }
+  resolveNativeAnchor(opts: { sessionId: string; workdir: string }): string | null {
     this.anchorCalls++;
+    if (this.missingNative.has(opts.sessionId)) return null;
     return this.forky ? this.tailAnchor : null;
+  }
+  anchorResolvable(opts: { sessionId: string; workdir: string; anchor: string }): boolean {
+    return this.unresolvableAnchors ? !this.unresolvableAnchors.has(opts.anchor) : true;
   }
   async run(input: AgentTurnInput, ctx: DriverContext): Promise<DriverResult> {
     this.runs.push(input);
+    if (this.failNext) {
+      this.failNext = false;
+      return { ok: false, text: '', error: `No message found with message.uuid of: ${input.fork?.anchor}`, sessionId: this.nextNativeId };
+    }
     ctx.emit({ type: 'session', sessionId: this.nextNativeId });
     const text = `reply to: ${input.prompt.slice(0, 40)}`;
     ctx.emit({ type: 'text', delta: text });
@@ -193,6 +207,81 @@ describe('Hub.forkSession', () => {
     const { sessionKey } = await seedParent(driver);
     await expect(loom.io.forkSession({ fromSessionKey: sessionKey, atTaskId: 'nope' })).rejects.toThrow(/fork point/);
   });
+
+  it('drops an anchor the driver can no longer resolve: a mid cut seeds instead of dying', async () => {
+    const driver = new ScriptedDriver('forky', true);
+    const { sessionKey, taskIds } = await seedParent(driver);
+    driver.unresolvableAnchors = new Set(['native-parent/a1']);   // e.g. behind a /compact boundary
+
+    const { sessionKey: forkKey } = await loom.io.forkSession({ fromSessionKey: sessionKey, atTaskId: taskIds[0] });
+    const store = new FsSessionStore(tmp);
+    const rec = (await store.get('forky', forkKey.split(':')[1]))!;
+    expect(rec.pendingFork).toEqual({ parentNativeSessionId: 'native-parent', anchor: null, mode: 'seed' });
+
+    // …and the branch actually runs: seeded, so the copied prefix rides the prompt.
+    driver.nextNativeId = 'native-seeded';
+    await loom.io.prompt({ prompt: 'branch question', sessionKey: forkKey });
+    await flushTurns();
+    expect(driver.runs.at(-1)!.prompt).toContain('User: first question');
+    expect((await store.get('forky', forkKey.split(':')[1]))!.nativeSessionId).toBe('native-seeded');
+  });
+
+  it('drops an unresolvable anchor on a TAIL cut and re-pins the parent tail instead', async () => {
+    const driver = new ScriptedDriver('forky', true);
+    const { sessionKey } = await seedParent(driver);
+    driver.unresolvableAnchors = new Set(['native-parent/a1']);
+
+    const { sessionKey: forkKey } = await loom.io.forkSession({ fromSessionKey: sessionKey });
+    const rec = (await new FsSessionStore(tmp).get('forky', forkKey.split(':')[1]))!;
+    expect(rec.pendingFork).toEqual({ parentNativeSessionId: 'native-parent', anchor: 'tail-anchor', mode: 'native' });
+    expect(driver.anchorCalls).toBe(1);   // consulted only because the recorded anchor was dropped
+  });
+
+  it('a fork whose first turn dies without a native session keeps the intent and re-forks', async () => {
+    const driver = new ScriptedDriver('forky', true);
+    const { sessionKey, taskIds } = await seedParent(driver);
+    const { sessionKey: forkKey } = await loom.io.forkSession({ fromSessionKey: sessionKey, atTaskId: taskIds[0] });
+    const forkId = forkKey.split(':')[1];
+    const store = new FsSessionStore(tmp);
+
+    // The agent rejects the run outright but still echoes back a session id it never created.
+    driver.nextNativeId = 'native-branch';
+    driver.missingNative.add('native-branch');
+    driver.failNext = true;
+    await loom.io.prompt({ prompt: 'branch question', sessionKey: forkKey });
+    await flushTurns();
+
+    const dead = (await store.get('forky', forkId))!;
+    expect(dead.nativeSessionId ?? null).toBeNull();     // never pin a phantom id…
+    expect(dead.pendingFork!.mode).toBe('native');       // …so the fork intent survives
+    expect(dead.runState).toBe('incomplete');
+
+    // The retry forks again off the parent — not a doomed resume of the phantom id.
+    driver.missingNative.delete('native-branch');
+    await loom.io.prompt({ prompt: 'try again', sessionKey: forkKey });
+    await flushTurns();
+    const retry = driver.runs.at(-1)!;
+    expect(retry.sessionId).toBe('native-parent');
+    expect(retry.fork).toEqual({ anchor: 'native-parent/a1' });
+    const settled = (await store.get('forky', forkId))!;
+    expect(settled.nativeSessionId).toBe('native-branch');
+    expect(settled.pendingFork).toBeNull();
+  });
+
+  it('a failed turn that DID create its native session still records the id', async () => {
+    const driver = new ScriptedDriver('forky', true);
+    const { sessionKey, taskIds } = await seedParent(driver);
+    const { sessionKey: forkKey } = await loom.io.forkSession({ fromSessionKey: sessionKey, atTaskId: taskIds[0] });
+
+    driver.nextNativeId = 'native-branch';   // present in the native store: the fork landed…
+    driver.failNext = true;                  // …and the turn failed afterwards
+    await loom.io.prompt({ prompt: 'branch question', sessionKey: forkKey });
+    await flushTurns();
+
+    const rec = (await new FsSessionStore(tmp).get('forky', forkKey.split(':')[1]))!;
+    expect(rec.nativeSessionId).toBe('native-branch');
+    expect(rec.pendingFork).toBeNull();      // the branch exists — a retry must resume it, not re-fork
+  });
 });
 
 describe('CodexDriver fork (hermetic fake app-server)', () => {
@@ -259,6 +348,48 @@ describe('native tail anchors', () => {
     ].join('\n') + '\n');
     expect(claudeTranscriptTailAnchor(workdir, 'sess-1', { home })).toBe('a1');
     expect(claudeTranscriptTailAnchor(workdir, 'missing', { home })).toBeNull();
+  });
+
+  // The exact hydration rule claude's --resume-session-at enforces: active leaf chain only, and
+  // only back to the last /compact boundary (which re-roots the transcript with a parentless
+  // record). A pre-compaction uuid — even an assistant reply — fails the whole run.
+  it('claudeAnchorResolvable tracks the active chain back to the last compaction boundary', () => {
+    const workdir = '/tmp/proj';
+    const dir = path.join(home, '.claude', 'projects', '-tmp-proj');
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(path.join(dir, 'sess-1.jsonl'), [
+      JSON.stringify({ type: 'user', uuid: 'old-u', parentUuid: null }),
+      JSON.stringify({ type: 'assistant', uuid: 'old-a', parentUuid: 'old-u' }),
+      JSON.stringify({ type: 'system', subtype: 'compact_boundary', uuid: 'bnd', parentUuid: null, logicalParentUuid: 'old-a' }),
+      JSON.stringify({ type: 'user', uuid: 'sum', parentUuid: 'bnd', isCompactSummary: true }),
+      JSON.stringify({ type: 'assistant', uuid: 'new-a', parentUuid: 'sum' }),
+      JSON.stringify({ type: 'user', uuid: 'side', parentUuid: 'new-a', isSidechain: true }),
+    ].join('\n') + '\n');
+
+    expect(claudeAnchorResolvable(workdir, 'sess-1', 'new-a', { home })).toBe(true);
+    expect(claudeAnchorResolvable(workdir, 'sess-1', 'sum', { home })).toBe(true);
+    expect(claudeAnchorResolvable(workdir, 'sess-1', 'old-a', { home })).toBe(false);   // behind /compact
+    expect(claudeAnchorResolvable(workdir, 'sess-1', 'old-u', { home })).toBe(false);
+    expect(claudeAnchorResolvable(workdir, 'sess-1', 'nope', { home })).toBe(false);
+    // A sidechain (subagent) record is never the chain leaf, so the main chain still resolves.
+    expect(claudeAnchorResolvable(workdir, 'sess-1', 'side', { home })).toBe(false);
+    // Inconclusive reads must not downgrade a healthy fork.
+    expect(claudeAnchorResolvable(workdir, 'missing', 'new-a', { home })).toBe(true);
+  });
+
+  it('claudeAnchorResolvable walks a dead rewind branch off the ACTIVE leaf only', () => {
+    const workdir = '/tmp/proj';
+    const dir = path.join(home, '.claude', 'projects', '-tmp-proj');
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(path.join(dir, 'sess-2.jsonl'), [
+      JSON.stringify({ type: 'user', uuid: 'u1', parentUuid: null }),
+      JSON.stringify({ type: 'assistant', uuid: 'a1', parentUuid: 'u1' }),
+      JSON.stringify({ type: 'assistant', uuid: 'dead', parentUuid: 'a1' }),   // abandoned by a rewind
+      JSON.stringify({ type: 'user', uuid: 'u2', parentUuid: 'a1' }),          // regenerated branch
+      JSON.stringify({ type: 'assistant', uuid: 'a2', parentUuid: 'u2' }),
+    ].join('\n') + '\n');
+    expect(claudeAnchorResolvable(workdir, 'sess-2', 'a1', { home })).toBe(true);
+    expect(claudeAnchorResolvable(workdir, 'sess-2', 'dead', { home })).toBe(false);
   });
 
   it('codexRolloutTailAnchor returns the last turn id in the rollout', () => {

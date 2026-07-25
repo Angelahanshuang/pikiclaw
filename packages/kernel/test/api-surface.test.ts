@@ -27,7 +27,7 @@ const MAIN = [
   'accountTokenSupported', 'accountTokenEnvVar', 'accountTokenEnv',
   // protocol
   'PROTOCOL_VERSION', 'emptySnapshot', 'diffSnapshot', 'applySnapshotPatch', 'isClientMessage',
-  'makeSessionKey', 'splitSessionKey',
+  'makeSessionKey', 'splitSessionKey', 'turnLanded',
 ].sort();
 
 const DRIVERS = [

@@ -2,13 +2,13 @@ import { randomUUID } from 'node:crypto';
 import {
   type UniversalSnapshot, type SnapshotPatch, type SessionMeta, type UniversalQueuedTask,
   type AgentInfo, type ModelDescriptor, type EffortOption, type ToolDescriptor, type SkillDescriptor,
-  diffSnapshot, emptySnapshot, makeSessionKey, splitSessionKey,
+  diffSnapshot, emptySnapshot, makeSessionKey, splitSessionKey, turnLanded,
 } from '../protocol/index.js';
 import type { AgentDriver, AgentTurnInput, McpServerSpec, TuiSpec } from '../contracts/driver.js';
 import type {
   SessionStore, ModelResolver, ToolProvider, SystemPromptBuilder, InteractionHandler, Catalog,
 } from '../contracts/ports.js';
-import type { LoomIO, PromptInput, ForkSessionInput, Plugin, SpawnContribution } from '../contracts/surface.js';
+import type { LoomIO, PromptInput, ForkSessionInput, ForkSessionResult, Plugin, SpawnContribution } from '../contracts/surface.js';
 import { SessionRunner } from './session-runner.js';
 import { buildForkSeed } from './fork.js';
 import { normalizeImageAttachments } from '../attachments.js';
@@ -133,7 +133,7 @@ export class Hub implements LoomIO {
   // consumes (fork-on-dispatch). The parent — record, transcript, native store — is never
   // mutated. Works for sessions the kernel never ran: a native-only session's id IS its
   // native id (the same assumption prompt() makes when resuming one).
-  async forkSession(input: ForkSessionInput): Promise<{ sessionKey: string }> {
+  async forkSession(input: ForkSessionInput): Promise<ForkSessionResult> {
     const { agent, sessionId: fromId } = splitSessionKey(input.fromSessionKey);
     const driver = this.deps.drivers.get(agent);
     if (!driver) throw new Error(`No driver registered for agent "${agent}"`);
@@ -145,19 +145,40 @@ export class Hub implements LoomIO {
     const turns = this.deps.sessionStore.history
       ? await this.deps.sessionStore.history(agent, fromId).catch(() => [] as UniversalSnapshot[])
       : [];
-    let kept = turns;
-    if (input.atTaskId) {
-      const cut = turns.findIndex(t => t.taskId === input.atTaskId);
-      if (cut < 0) throw new Error(`fork point ${input.atTaskId} not found in ${input.fromSessionKey}`);
-      kept = turns.slice(0, cut + 1);
-    }
-    const cutIsTail = kept.length === turns.length;
+    const requested = input.atTaskId ? turns.findIndex(t => t.taskId === input.atTaskId) : turns.length - 1;
+    if (input.atTaskId && requested < 0) throw new Error(`fork point ${input.atTaskId} not found in ${input.fromSessionKey}`);
+    // A round the agent refused before writing anything (`turnLanded` false) is NOT a boundary:
+    // no answer to inherit, and nothing in the agent's own store to anchor against. Cutting there
+    // would copy a dead round into the branch AND force the seed fallback on a conversation that
+    // has a perfectly good boundary one turn earlier — so step back to it and report what was
+    // skipped. Applies to a tail fork too: trailing dead rounds are invisible to the agent, so a
+    // branch that kept them would show turns its native context has never heard of.
+    let cut = requested;
+    while (cut >= 0 && !turnLanded(turns[cut])) cut--;
+    const droppedTaskIds = turns.slice(cut + 1, requested + 1)
+      .map(t => t.taskId).filter((id): id is string => !!id);
+    const kept = turns.slice(0, cut + 1);
+    // Stepping back past EVERY turn (a transcript whose rounds all died) leaves nothing to
+    // inherit: there is no boundary, and the parent's native session — if it exists at all — holds
+    // none of these rounds. Such a branch must start clean (seed with an empty prefix), never
+    // resume the parent natively. Distinct from an empty transcript, which is the normal shape of
+    // a native-only session the kernel never ran and whose tail fork is perfectly valid.
+    const keptNothing = cut < 0 && turns.length > 0;
+    // "Tail" is about what the AGENT sees: the caller asked for the parent's last turn, and
+    // anything the step-back skipped never reached the native store — so the parent's current
+    // native tip is still exactly this cut, and resolveNativeAnchor may pin it below.
+    const cutIsTail = requested === turns.length - 1 && !keptNothing;
 
-    // Pin the native keep-boundary at fork time: explicit override → the kept turn's recorded
-    // anchor → the parent's CURRENT tail (tail cuts only). A mid cut that can't be anchored
-    // falls back to a seed fork — a tail-anchored native fork there would silently absorb the
-    // dropped turns, which is worse than the seed's lower fidelity.
-    let anchor = input.anchor ?? kept[kept.length - 1]?.anchor ?? null;
+    // Pin the native keep-boundary at fork time: explicit override (only when the cut landed
+    // where the caller asked — an override names ONE turn) → the caller's per-turn anchor map
+    // → the kept turn's recorded anchor → the parent's CURRENT tail (tail cuts only). A mid cut
+    // that can't be anchored falls back to a seed fork — a tail-anchored native fork there would
+    // silently absorb the dropped turns, which is worse than the seed's lower fidelity.
+    const cutTurn = kept[kept.length - 1] ?? null;
+    const cutTaskId = cutTurn?.taskId ?? null;
+    const overrideAnchor = droppedTaskIds.length ? null : input.anchor ?? null;
+    const mappedAnchor = cutTaskId ? input.anchors?.[cutTaskId] ?? null : null;
+    let anchor = overrideAnchor ?? mappedAnchor ?? cutTurn?.anchor ?? null;
     // An anchor the agent can no longer resolve is worse than none — claude fails the entire run
     // at `--resume-session-at`, so the branch would die on its first dispatch with nothing to
     // retry. Drop it: a tail cut re-pins the parent's current tip below, a mid cut seeds instead.
@@ -180,20 +201,22 @@ export class Hub implements LoomIO {
     }
     const rec = await this.deps.sessionStore.get(agent, newId);
     if (rec) {
-      const last = kept[kept.length - 1];
-      rec.model = parent?.model ?? last?.model ?? null;
-      rec.effort = parent?.effort ?? last?.effort ?? null;
+      rec.model = parent?.model ?? cutTurn?.model ?? null;
+      rec.effort = parent?.effort ?? cutTurn?.effort ?? null;
       rec.preview = parent?.preview ?? null;
       // ensure() stamps fresh records 'running' (prompt() marks them properly right after);
       // a fork has not dispatched anything yet — settle it so it can't read as a live turn.
       rec.runState = 'completed';
       rec.runDetail = null;
-      rec.forkedFrom = { sessionKey: input.fromSessionKey, taskId: input.atTaskId ?? last?.taskId ?? null };
+      // Lineage records the cut that HAPPENED, not the one that was asked for — a branch labelled
+      // with a turn it doesn't contain is a lie the UI would render.
+      rec.forkedFrom = { sessionKey: input.fromSessionKey, taskId: cutTaskId };
       rec.pendingFork = { parentNativeSessionId: parentNativeId, anchor, mode };
       await this.deps.sessionStore.save(rec);
     }
-    this.deps.log?.(`[hub] forked ${input.fromSessionKey} -> ${agent}:${newId} (${mode}${anchor ? `, anchor ${anchor}` : ''}, ${kept.length}/${turns.length} turns)`);
-    return { sessionKey: makeSessionKey(agent, newId) };
+    const skipped = droppedTaskIds.length ? `, skipped ${droppedTaskIds.length} unlanded` : '';
+    this.deps.log?.(`[hub] forked ${input.fromSessionKey} -> ${agent}:${newId} (${mode}${anchor ? `, anchor ${anchor}` : ''}, ${kept.length}/${turns.length} turns${skipped})`);
+    return { sessionKey: makeSessionKey(agent, newId), atTaskId: cutTaskId, anchor, mode, droppedTaskIds };
   }
 
   // Rewind `sessionKey` IN PLACE to a turn boundary: drop the transcript after `atTaskId` (the

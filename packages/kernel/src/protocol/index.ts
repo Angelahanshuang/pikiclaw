@@ -152,6 +152,23 @@ export function emptySnapshot(): UniversalSnapshot {
   return { phase: 'idle', updatedAt: 0 };
 }
 
+/**
+ * Whether a settled turn left a trace behind — the test for whether it can serve as a
+ * conversation BOUNDARY (a fork or rewind cut point).
+ *
+ * A turn the agent refused before doing anything (an over-long prompt, a failed pre-flight,
+ * a spawn error) settles with an `error` and literally no output: no text, no reasoning, no
+ * tool call — and nothing in the agent's OWN transcript either, so {@link UniversalSnapshot.anchor}
+ * is empty too. Cutting *at* such a turn is meaningless: there is no answer to inherit, no native
+ * boundary to pin, and a branch made there opens on a dead round whose prompt was never answered.
+ * A turn that errored AFTER producing something (an interrupt, a mid-flight crash) did land and
+ * stays a perfectly good boundary — its output is real context.
+ */
+export function turnLanded(turn: Pick<UniversalSnapshot, 'error' | 'text' | 'reasoning' | 'toolCalls'>): boolean {
+  if (!turn.error) return true;
+  return !!turn.text?.trim() || !!turn.reasoning?.trim() || !!turn.toolCalls?.length;
+}
+
 const APPEND_FIELDS = ['text', 'reasoning'] as const;
 const STRUCT_FIELDS = ['plan', 'toolCalls', 'subAgents', 'usage', 'artifacts', 'interactions', 'queued', 'compaction'] as const;
 const SCALAR_FIELDS = ['phase', 'taskId', 'sessionId', 'agent', 'model', 'effort', 'prompt', 'activity', 'error', 'incomplete', 'startedAt', 'updatedAt', 'anchor'] as const;

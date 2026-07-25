@@ -8,6 +8,7 @@ import { buildForkSeed } from '../src/runtime/fork.js';
 import { claudeResumeArgs } from '../src/drivers/claude.js';
 import { CodexDriver } from '../src/drivers/codex.js';
 import { claudeAnchorResolvable, claudeTranscriptTailAnchor, codexRolloutTailAnchor } from '../src/drivers/native.js';
+import { turnLanded } from '../src/protocol/index.js';
 import type { AgentDriver, AgentTurnInput, DriverContext, DriverResult, DriverEvent } from '../src/contracts/driver.js';
 
 const flushTurns = () => new Promise((r) => setTimeout(r, 50));
@@ -84,6 +85,19 @@ describe('buildForkSeed', () => {
   });
 });
 
+describe('turnLanded (the boundary rule)', () => {
+  it('a clean turn is a boundary, a refused one is not', () => {
+    expect(turnLanded({ text: 'an answer' })).toBe(true);
+    expect(turnLanded({ error: 'Prompt is too long', text: '', reasoning: '', toolCalls: [] })).toBe(false);
+    expect(turnLanded({ error: 'spawn ENOENT' })).toBe(false);
+  });
+  it('an error AFTER output is still a boundary — an interrupt leaves real context', () => {
+    expect(turnLanded({ error: 'Interrupted by user.', text: 'partial' })).toBe(true);
+    expect(turnLanded({ error: 'crashed', reasoning: 'thinking…' })).toBe(true);
+    expect(turnLanded({ error: 'crashed', toolCalls: [{ id: 'c1', name: 'Bash', status: 'done' }] })).toBe(true);
+  });
+});
+
 describe('Hub.forkSession', () => {
   let tmp: string;
   let loom: Loom;
@@ -98,6 +112,16 @@ describe('Hub.forkSession', () => {
     const second = await loom.io.prompt({ prompt: 'second question', sessionKey: first.sessionKey });
     await flushTurns();
     return { sessionKey: first.sessionKey, taskIds: [first.taskId, second.taskId] };
+  }
+
+  /** …plus a third round the agent REFUSES outright: error, no output, no anchor — the shape an
+   *  over-long prompt or a failed pre-flight leaves behind. */
+  async function seedParentWithRefusedTail(driver: ScriptedDriver) {
+    const parent = await seedParent(driver);
+    driver.failNext = true;
+    const refused = await loom.io.prompt({ prompt: 'a prompt the agent refuses', sessionKey: parent.sessionKey });
+    await flushTurns();
+    return { ...parent, refusedTaskId: refused.taskId };
   }
 
   it('native mode: copies the kept prefix, pins the anchor, and fork-dispatches off the parent native id', async () => {
@@ -288,6 +312,76 @@ describe('Hub.forkSession', () => {
     const settled = (await store.get('forky', forkId))!;
     expect(settled.nativeSessionId).toBe('native-branch');
     expect(settled.pendingFork).toBeNull();
+  });
+
+  it('a cut aimed at a refused round steps back to the last real boundary and says so', async () => {
+    const driver = new ScriptedDriver('forky', true);
+    const { sessionKey, taskIds, refusedTaskId } = await seedParentWithRefusedTail(driver);
+    const parentTurns = await loom.io.getHistory(sessionKey);
+    expect(parentTurns.length).toBe(3);
+    expect(turnLanded(parentTurns[2])).toBe(false);      // the refused round IS on record…
+
+    const forked = await loom.io.forkSession({ fromSessionKey: sessionKey, atTaskId: refusedTaskId });
+    expect(forked.atTaskId).toBe(taskIds[1]);            // …but it can't be a cut point
+    expect(forked.droppedTaskIds).toEqual([refusedTaskId]);
+    // The real boundary has an anchor, so the branch keeps its NATIVE fork instead of falling
+    // back to replaying the whole conversation as a seed.
+    expect(forked.mode).toBe('native');
+    expect(forked.anchor).toBe('native-parent/a1');
+
+    const branch = await loom.io.getHistory(forked.sessionKey);
+    expect(branch.map(t => t.prompt)).toEqual(['first question', 'second question']);  // no dead round cloned
+    const rec = (await new FsSessionStore(tmp).get('forky', forked.sessionKey.split(':')[1]))!;
+    expect(rec.forkedFrom).toEqual({ sessionKey, taskId: taskIds[1] });                // lineage tells the truth
+    expect(rec.pendingFork).toEqual({ parentNativeSessionId: 'native-parent', anchor: 'native-parent/a1', mode: 'native' });
+  });
+
+  it('a TAIL fork trims trailing refused rounds and is still a tail cut', async () => {
+    const driver = new ScriptedDriver('forky', true);
+    const { sessionKey, taskIds, refusedTaskId } = await seedParentWithRefusedTail(driver);
+
+    const forked = await loom.io.forkSession({ fromSessionKey: sessionKey });   // no atTaskId
+    expect(forked.atTaskId).toBe(taskIds[1]);
+    expect(forked.droppedTaskIds).toEqual([refusedTaskId]);
+    expect(forked.mode).toBe('native');
+    expect((await loom.io.getHistory(forked.sessionKey)).length).toBe(2);
+  });
+
+  it('the anchors map re-anchors the turn the cut stepped BACK to; a single-turn override does not', async () => {
+    const driver = new ScriptedDriver('forky', true);
+    const { sessionKey, taskIds, refusedTaskId } = await seedParentWithRefusedTail(driver);
+    // Pre-anchor-era transcript: no recorded anchors, so only the caller's map can supply one.
+    const turnsPath = path.join(tmp, 'forky', sessionKey.split(':')[1], 'turns.jsonl');
+    fs.writeFileSync(turnsPath, fs.readFileSync(turnsPath, 'utf8').split('\n').filter(Boolean)
+      .map(l => JSON.stringify({ ...JSON.parse(l), anchor: null })).join('\n') + '\n');
+
+    const forked = await loom.io.forkSession({
+      fromSessionKey: sessionKey,
+      atTaskId: refusedTaskId,
+      anchor: 'names-the-refused-turn',            // an override names ONE turn — the cut moved, so drop it
+      anchors: { [taskIds[1]]: 'app-resolved-2' }, // …the per-turn map still answers for the new cut
+    });
+    expect(forked.atTaskId).toBe(taskIds[1]);
+    expect(forked.anchor).toBe('app-resolved-2');
+    expect(forked.mode).toBe('native');
+  });
+
+  it('a transcript whose rounds ALL died branches clean instead of resuming the parent natively', async () => {
+    const driver = new ScriptedDriver('forky', true);
+    loom = createLoom({ drivers: [driver as AgentDriver], defaultAgent: driver.id, sessionStore: new FsSessionStore(tmp), workdir: tmp });
+    driver.failNext = true;
+    const first = await loom.io.prompt({ prompt: 'refused one' });
+    await flushTurns();
+    driver.failNext = true;
+    await loom.io.prompt({ prompt: 'refused two', sessionKey: first.sessionKey });
+    await flushTurns();
+
+    const forked = await loom.io.forkSession({ fromSessionKey: first.sessionKey });
+    expect(forked.atTaskId).toBeNull();                  // nothing landed, so nothing is kept
+    expect(forked.anchor).toBeNull();
+    expect(forked.mode).toBe('seed');                    // never a native resume of a session with no content
+    expect(forked.droppedTaskIds.length).toBe(2);
+    expect((await loom.io.getHistory(forked.sessionKey)).length).toBe(0);
   });
 
   it('a failed turn that DID create its native session still records the id', async () => {

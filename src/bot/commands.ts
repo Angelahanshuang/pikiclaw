@@ -42,7 +42,10 @@ export interface StartData {
 export function getStartData(bot: Bot, chatId: ChatId): StartData {
   const cs = bot.chat(chatId);
   const intro = buildWelcomeIntro(VERSION);
-  const commands = buildBotMenuState(bot).commands;
+  const rawCommands = buildBotMenuState(bot).commands;
+  // 简化命令提示，隐藏敏感命令
+  const hiddenCommands = ['switch', 'workspaces', 'host'];
+  const commands = rawCommands.filter(c => !hiddenCommands.includes(c.command));
   const res = bot.fetchAgents();
   const agentDetails: AgentDetail[] = res.agents
     .filter(a => a.installed)

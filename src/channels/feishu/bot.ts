@@ -16,6 +16,7 @@ import {
 } from '../../bot/orchestration.js';
 import {
   stageSessionFiles,
+  resolveCanonicalSessionId,
 } from '../../agent/index.js';
 import type { McpSendFileCallback } from '../../agent/mcp/bridge.js';
 import { shutdownAllDrivers } from '../../agent/driver.js';
@@ -70,7 +71,14 @@ import {
   resolveFeishuRegisteredPath,
 } from './render.js';
 import { currentHumanLoopQuestion, humanLoopOptionSelected, type HumanLoopPromptState, type ResolvedHumanLoopAnswers } from '../../bot/human-loop.js';
-import { FeishuChannel, type FeishuContext, type FeishuCallbackContext, type FeishuMessage } from './channel.js';
+import {
+  FeishuChannel,
+  type FeishuContext,
+  type FeishuCallbackContext,
+  type FeishuMessage,
+  type FeishuGroupThreadContext,
+  type FeishuGroupThreadDecision,
+} from './channel.js';
 import { splitText, supportsChannelCapability } from '../base.js';
 import { getActiveUserConfig, loadKnownChatIds } from '../../core/config/user-config.js';
 import { VERSION } from '../../core/version.js';
@@ -151,6 +159,19 @@ function formatToolLog(activity: string | null | undefined): string {
   return summary.length <= 240 ? summary : `${summary.slice(0, 237).trimEnd()}...`;
 }
 
+/**
+ * @file FeishuBot 核心入口
+ * @description 
+ * 总览注释：
+ * 它是 pikiloom-local 连接飞书开放平台的核心 Adapter。
+ * 负责飞书 Webhook 事件的接收、意图路由（基于用户的指令分配 Agent）、
+ * 会话管理（Session 的映射、群聊的话题 Thread 隔离）、
+ * 以及长文本和 Markdown 流式消息（LivePreview）在飞书卡片上的最终渲染呈现。
+ * 包含的阶段改造：
+ * - 基于 thread_id / root_id / parent_id 的群聊话题隔离与续聊路由
+ * - 基于正则表达式拦截文本，将文案任务智能路由到 codex 模型
+ * - 消息结束时将 Token 用量异步写入 PostgreSQL
+ */
 export class FeishuBot extends Bot {
   private appId: string;
   private appSecret: string;
@@ -158,6 +179,7 @@ export class FeishuBot extends Bot {
   private channel!: FeishuChannel;
 
   private sessionMessages = new SessionMessageRegistry<string, string>();
+  private threadSessions = new Map<string, string>();
   private nextTaskId = 1;
   private shutdownInFlight = false;
   private shutdownExitCode: number | null = null;
@@ -268,29 +290,162 @@ export class FeishuBot extends Bot {
     this.sessionMessages.registerMany(chatId, messageIds, session, session.workdir);
   }
 
+  private threadSessionKey(chatId: string, threadId: string): string {
+    return `${chatId}:${threadId}`;
+  }
+
+  private sessionFromThread(chatId: string, threadId: string | null | undefined): SessionRuntime | null {
+    const normalizedThreadId = String(threadId || '').trim();
+    if (!normalizedThreadId) return null;
+    const sessionKey = this.threadSessions.get(this.threadSessionKey(chatId, normalizedThreadId));
+    if (!sessionKey) return null;
+    const session = this.getSessionRuntimeByKey(sessionKey, { allowAnyWorkdir: true });
+    if (session) return session;
+
+    this.threadSessions.delete(this.threadSessionKey(chatId, normalizedThreadId));
+    this.warn(`[resolveSession] dropped stale thread binding chat=${chatId} thread=${normalizedThreadId} sessionKey=${sessionKey}`);
+    return null;
+  }
+
+  // [中文注释] thread_id 是飞书官方定义的“话题消息”主标识。
+  // 一旦某个 thread_id 已绑定到 session，后续同话题消息就不该再要求用户反复 @bot。
+  private bindThreadSession(chatId: string, threadId: string | null | undefined, session: SessionRuntime, reason: string) {
+    const normalizedThreadId = String(threadId || '').trim();
+    if (!normalizedThreadId) return;
+    const key = this.threadSessionKey(chatId, normalizedThreadId);
+    const prev = this.threadSessions.get(key);
+    if (prev === session.key) return;
+    this.threadSessions.set(key, session.key);
+    this.log(
+      `[thread-bind] chat=${chatId} thread=${normalizedThreadId} session=${session.sessionId} reason=${reason}${prev ? ` prev=${prev}` : ''}`,
+    );
+  }
+
   private sessionFromMessage(chatId: string, messageId: string | null | undefined): SessionRuntime | null {
     const sessionRef = this.sessionMessages.resolve(chatId, messageId);
     if (!sessionRef) return null;
-    return this.getSessionRuntimeByKey(sessionRef.key, { allowAnyWorkdir: true })
-      || this.hydrateSessionRuntime(sessionRef);
+    const live = this.getSessionRuntimeByKey(sessionRef.key, { allowAnyWorkdir: true });
+    if (live) return live;
+
+    const originalSessionId = String(sessionRef.sessionId || '').trim();
+    const canonicalSessionId = originalSessionId
+      ? resolveCanonicalSessionId(sessionRef.workdir, sessionRef.agent, originalSessionId)
+      : originalSessionId;
+
+    // [中文注释] 飞书消息引用里可能还留着旧的 pending sessionId。
+    // 一旦该 pending 已经 promotion 到 native session，这里必须先做 canonical 化，
+    // 否则 stagedFiles 会留在 native session 上，后续文字消息却从旧 pending 继续跑，最终把图片丢掉。
+    const canonicalRef = canonicalSessionId && canonicalSessionId !== originalSessionId
+      ? {
+          ...sessionRef,
+          key: this.sessionKey(sessionRef.agent, canonicalSessionId),
+          sessionId: canonicalSessionId,
+          workspacePath: null,
+        }
+      : sessionRef;
+
+    if (canonicalRef !== sessionRef) {
+      this.log(
+        `[resolveSession] canonicalized message ref chat=${chatId} msg=${messageId || '-'} session=${originalSessionId} -> ${canonicalSessionId}`,
+      );
+    }
+
+    return this.getSessionRuntimeByKey(canonicalRef.key, { allowAnyWorkdir: true })
+      || this.hydrateSessionRuntime(canonicalRef);
+  }
+
+  private resolveSessionFromThreadContext(
+    ctx: Pick<FeishuContext, 'chatId' | 'messageId' | 'threadId' | 'rootMessageId' | 'replyToMessageId'>,
+    source: string,
+  ): SessionRuntime | null {
+    const threadId = ctx.threadId || null;
+    if (threadId) {
+      const threadSession = this.sessionFromThread(ctx.chatId, threadId);
+      if (threadSession) {
+        this.log(
+          `[resolveSession] thread matched session=${threadSession.sessionId} chat=${ctx.chatId} thread=${threadId} source=${source}`,
+        );
+        return threadSession;
+      }
+    }
+
+    const candidates: Array<{ label: string; messageId: string | null }> = [
+      { label: 'reply', messageId: ctx.replyToMessageId || null },
+      { label: 'root', messageId: ctx.rootMessageId || null },
+    ];
+    const seen = new Set<string>();
+    for (const candidate of candidates) {
+      const messageId = candidate.messageId || null;
+      if (!messageId || seen.has(messageId)) continue;
+      seen.add(messageId);
+      const session = this.sessionFromMessage(ctx.chatId, messageId);
+      if (!session) continue;
+      this.log(
+        `[resolveSession] ${candidate.label} matched session=${session.sessionId} chat=${ctx.chatId} thread=${threadId || '-'} source=${source} msg_ref=${messageId}`,
+      );
+      if (threadId) this.bindThreadSession(ctx.chatId, threadId, session, `${source}:${candidate.label}`);
+      return session;
+    }
+
+    return null;
+  }
+
+  private decideGroupThreadContinuation(ctx: FeishuGroupThreadContext): FeishuGroupThreadDecision {
+    const session = this.resolveSessionFromThreadContext({
+      chatId: ctx.chatId,
+      messageId: ctx.messageId,
+      threadId: ctx.threadId,
+      rootMessageId: ctx.rootMessageId,
+      replyToMessageId: ctx.parentMessageId,
+    }, 'group-thread-gate');
+    if (!session) {
+      return { allow: false, reason: 'no-session-match' };
+    }
+    return {
+      allow: true,
+      reason: `session=${session.sessionId}`,
+    };
   }
 
   private ensureSession(chatId: string, title: string, files: string[]): SessionRuntime {
     return this.ensureSessionForChat(chatId, title, files);
   }
 
+  /**
+   * 路由与建立入站 Session
+   * @description
+   * 负责解决飞书群聊里的 thread 隔离与续聊匹配。
+   * 群聊顶层消息进入时会创建新 session；后续同一话题内的消息通过
+   * thread_id / root_id / parent_id 继续命中原 session。
+   */
   private resolveIncomingSession(ctx: FeishuContext, text: string, files: string[]): SessionRuntime {
     const cs = this.chat(ctx.chatId);
-    const replyMessageId = ctx.replyToMessageId || null;
-    const repliedSession = this.sessionFromMessage(ctx.chatId, replyMessageId);
+    this.log(
+      `[resolveSession] chat=${ctx.chatId} msg=${ctx.messageId || '-'} chatType=${ctx.chatType} thread=${ctx.threadId || '-'} root=${ctx.rootMessageId || '-'} replyTo=${ctx.replyToMessageId || '-'} text_chars=${text.length} files=${files.length}`,
+    );
+
+    const repliedSession = this.resolveSessionFromThreadContext(ctx, 'resolve-session');
     if (repliedSession) {
-      this.log(`[resolveSession] reply matched session=${repliedSession.sessionId} chat=${ctx.chatId}`);
       this.applySessionSelection(cs, repliedSession);
       return repliedSession;
     }
+
+    // [中文注释] 群聊顶层消息没有 thread_id，后面会通过 reply_in_thread 主动开启一个独立话题。
+    // 这里不额外做分支，只保留这个语义说明，实际的新 session 创建走统一的 ensureSession()。
+
     const selected = this.getSelectedSession(cs);
-    if (selected) return selected;
-    return this.ensureSession(ctx.chatId, text, files);
+    // For group chats, we want to force thread isolation, so we ignore the "selected" global chat session
+    // unless it's a p2p chat.
+    if (selected && ctx.chatType === 'p2p') {
+      this.log(`[resolveSession] reuse selected session=${selected.sessionId} chat=${ctx.chatId} chatType=p2p`);
+      return selected;
+    }
+    const created = this.ensureSession(ctx.chatId, text, files);
+    if (ctx.threadId) {
+      this.bindThreadSession(ctx.chatId, ctx.threadId, created, 'resolve-session:new-session');
+    }
+    this.log(`[resolveSession] ensured session=${created.sessionId} chat=${ctx.chatId} agent=${created.agent}`);
+    return created;
   }
 
   private async cmdStart(ctx: FeishuContext) {
@@ -623,6 +778,12 @@ export class FeishuBot extends Bot {
     const canEditMessages = supportsChannelCapability(this.channel, 'editMessages');
     let placeholderId: string | null = null;
     try {
+      //在 ImTaskPresenter 中，我们没有 ctx，但我们知道它正在继续现有会话。
+      //所以它只会向聊天发送一条消息。
+      //飞书群可能在线程中需要它，但我们不知道这里的线程根。
+      //等等，如果我们只是发送到聊天，除非我们传递replyTo，否则它不会在线程中。
+      //如果可能的话，让我们将此会话的最新消息 ID 作为replyTo 传递。
+      //现在，我们将保持原样，或者我们可以使用 `opts.session` 来查找最后一条消息。
       placeholderId = await this.channel.send(
         chatId,
         buildInitialPreviewMarkdown(opts.agent, startConfig.model, startConfig.effort, false),
@@ -693,9 +854,23 @@ export class FeishuBot extends Bot {
     } catch {}
   }
 
+  /**
+   * 核心消息处理链路 (Message Handler)
+   * @description 
+   * 接收飞书推过来的真实消息体，执行以下关键步骤：
+   * 1. 查找或建立用户独属的 Session 实例。
+   * 2. 执行【智能路由拦截】(检查是否匹配“写文案”等正则，若是则强切 codex 模型）  TODO 引入deepseek等低价模型来判断是否需要切换到 codex 模型
+   * 3. 将任务推入执行队列 (beginTask / queueSessionTask)。
+   * 4. 向飞书发送一条带有 “思考中…” 状态的占位消息 (Placeholder Message)。
+   * 5. 持续接收 LLM 流式事件，并调用 LivePreview 更新飞书消息状态。
+   * 6. 任务结束时，将 Token 消耗日志写入 PostgreSQL。
+   */
   private async handleMessage(msg: FeishuMessage, ctx: FeishuContext) {
     const text = msg.text.trim();
     if (!text && !msg.files.length) return;
+    this.log(
+      `[handleMessage] inbound chat=${ctx.chatId} msg=${ctx.messageId || '-'} chatType=${ctx.chatType} thread=${ctx.threadId || '-'} root=${ctx.rootMessageId || '-'} replyTo=${ctx.replyToMessageId || '-'} text_chars=${text.length} files=${msg.files.length}`,
+    );
     const pendingPrompt = this.pendingHumanLoopPrompt(ctx.chatId);
     if (pendingPrompt && text && !msg.files.length && !text.startsWith('/')) {
       const result = this.humanLoopSubmitText(ctx.chatId, text);
@@ -710,6 +885,7 @@ export class FeishuBot extends Bot {
     const session = this.resolveIncomingSession(ctx, text, msg.files);
     const cs = this.chat(ctx.chatId);
     this.applySessionSelection(cs, session);
+    this.bindThreadSession(ctx.chatId, ctx.threadId, session, 'handle-message:inbound');
     this.registerSessionMessage(ctx.chatId, ctx.messageId, session);
 
     if (!text && msg.files.length) {
@@ -773,8 +949,16 @@ export class FeishuBot extends Bot {
     const startConfig = this.resolveSessionStreamConfig(session);
     const model = startConfig.model;
     const effort = startConfig.effort;
+    
+    // [中文注释] 群顶层消息需要显式开启新话题；已经带 thread_id 的消息则继续沿用当前话题回复。
+    const replyInThread = ctx.chatType === 'group' && (!ctx.replyToMessageId || !!ctx.threadId);
+    this.log(
+      `[handleMessage] send placeholder chat=${ctx.chatId} msg=${ctx.messageId || '-'} session=${session.sessionId} thread=${ctx.threadId || '-'} root=${ctx.rootMessageId || '-'} replyInThread=${replyInThread} waiting=${waiting} queue=${queuePosition}`,
+    );
+
     const placeholderId = await this.channel.send(ctx.chatId, buildInitialPreviewMarkdown(session.agent, model, effort, waiting, queuePosition), {
       replyTo: ctx.messageId || undefined,
+      replyInThread,
       keyboard: placeholderKeyboard,
     });
     if (placeholderId) {
@@ -1061,6 +1245,8 @@ export class FeishuBot extends Bot {
       from: ctx.from,
       chatType: 'p2p',
       replyToMessageId: null,
+      threadId: null,
+      rootMessageId: null,
       reply: (text, opts) => ctx.channel.send(ctx.chatId, text, opts),
       editReply: (msgId, text, opts) => ctx.channel.editMessage(ctx.chatId, msgId, text, opts),
       channel: ctx.channel,
@@ -1243,6 +1429,7 @@ export class FeishuBot extends Bot {
 
       this.channel.onCommand((cmd, args, ctx) => this.handleCommand(cmd, args, ctx));
       this.channel.onMessage((msg, ctx) => this.handleMessage(msg, ctx));
+      this.channel.onGroupThreadContinuationCheck(ctx => this.decideGroupThreadContinuation(ctx));
       this.channel.onCallback((data, ctx) => this.handleCallback(data, ctx));
       this.channel.onMessageRecalled((messageId, chatId) => this.handleMessageRecalled(messageId, chatId));
       this.channel.onError(err => this.log(`error: ${err}`));

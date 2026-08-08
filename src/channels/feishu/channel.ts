@@ -58,15 +58,33 @@ export interface FeishuContext {
   from: FeishuFrom;
   chatType: 'p2p' | 'group';
   replyToMessageId: string | null;
+  threadId: string | null;
+  rootMessageId: string | null;
   reply: (text: string, opts?: SendOpts) => Promise<string | null>;
   editReply: (msgId: string, text: string, opts?: SendOpts) => Promise<void>;
   channel: FeishuChannel;
   raw: any;
 }
 
+export interface FeishuGroupThreadContext {
+  chatId: string;
+  messageId: string;
+  from: FeishuFrom;
+  threadId: string;
+  rootMessageId: string | null;
+  parentMessageId: string | null;
+  raw: any;
+}
+
+export interface FeishuGroupThreadDecision {
+  allow: boolean;
+  reason: string;
+}
+
 export type FeishuCommandHandler = (cmd: string, args: string, ctx: FeishuContext) => Promise<any> | any;
 export type FeishuMessageHandler = (msg: FeishuMessage, ctx: FeishuContext) => Promise<any> | any;
 export type FeishuErrorHandler = (err: Error) => void;
+export type FeishuGroupThreadHandler = (ctx: FeishuGroupThreadContext) => Promise<FeishuGroupThreadDecision> | FeishuGroupThreadDecision;
 
 export interface FeishuCallbackContext {
   chatId: string;
@@ -157,6 +175,10 @@ function isFeishuNotModifiedMessage(msg: string): boolean {
     || lower.includes('same content')
     || lower.includes('same as before')
     || lower.includes('no change');
+}
+
+function normalizeIdentityValue(value: unknown): string {
+  return String(value || '').trim().toLowerCase();
 }
 
 function buildPostContent(paragraphs: Array<Array<Record<string, unknown>>>, title = ''): string {
@@ -297,6 +319,7 @@ class FeishuChannel extends Channel {
 
   private _hCommand: FeishuCommandHandler | null = null;
   private _hMessage: FeishuMessageHandler | null = null;
+  private _hGroupThread: FeishuGroupThreadHandler | null = null;
   private _hCardAction: FeishuCallbackHandler | null = null;
   private _hRecall: FeishuRecallHandler | null = null;
   private _hError: FeishuErrorHandler | null = null;
@@ -332,6 +355,7 @@ class FeishuChannel extends Channel {
 
   onCommand(h: FeishuCommandHandler)   { this._hCommand = h; }
   onMessage(h: FeishuMessageHandler)   { this._hMessage = h; }
+  onGroupThreadContinuationCheck(h: FeishuGroupThreadHandler) { this._hGroupThread = h; }
   onCallback(h: FeishuCallbackHandler) { this._hCardAction = h; }
   onMessageRecalled(h: FeishuRecallHandler) { this._hRecall = h; }
   onError(h: FeishuErrorHandler)       { this._hError = h; }
@@ -458,6 +482,9 @@ class FeishuChannel extends Channel {
     const messageId = msg.message_id as string;
     const chatType: 'p2p' | 'group' = msg.chat_type === 'p2p' ? 'p2p' : 'group';
     const msgType = msg.message_type as string;
+    const parentId = typeof msg.parent_id === 'string' && msg.parent_id ? msg.parent_id : null;
+    const rootId = typeof msg.root_id === 'string' && msg.root_id ? msg.root_id : null;
+    const threadId = typeof msg.thread_id === 'string' && msg.thread_id ? msg.thread_id : null;
 
     if (!chatId || !messageId) return;
 
@@ -483,18 +510,50 @@ class FeishuChannel extends Channel {
       name: '',
     };
 
+    this._log(
+      `[recv] inbound chat=${chatId} msg=${messageId} type=${chatType}/${msgType} sender_open=${from.openId || '-'} sender_user=${from.userId || '-'} thread=${threadId || '-'} root=${rootId || '-'} parent=${parentId || '-'} mentions=${Array.isArray(msg.mentions) ? msg.mentions.length : 0}`,
+      'info',
+    );
+
     if (from.openId) this._openIdToChat.set(from.openId, chatId);
 
     if (chatType === 'group') {
-      if (shouldLog('debug')) this._debug(`[recv] group check mention: bot=${JSON.stringify(this.bot)}, mentions=${JSON.stringify(msg.mentions)}`);
-      if (!this._isBotMentioned(msg)) {
-        this._debug(`[recv] skipped: not mentioned in group ${chatId}`);
-        return;
+      let allowWithoutMention = false;
+      if (threadId && this._hGroupThread) {
+        try {
+          const threadDecision = await this._hGroupThread({
+            chatId,
+            messageId,
+            from,
+            threadId,
+            rootMessageId: rootId,
+            parentMessageId: parentId,
+            raw: event,
+          });
+          allowWithoutMention = !!threadDecision?.allow;
+          this._log(
+            `[recv] group thread gate chat=${chatId} msg=${messageId} allow=${allowWithoutMention} reason=${threadDecision?.reason || '-'} thread=${threadId} root=${rootId || '-'} parent=${parentId || '-'}`,
+            allowWithoutMention ? 'info' : 'warn',
+          );
+        } catch (e: any) {
+          this._log(`[recv] group thread gate failed chat=${chatId} msg=${messageId}: ${e?.message || e}`, 'warn');
+        }
+      }
+
+      if (!allowWithoutMention) {
+        const mentionCheck = this._inspectBotMention(msg);
+        this._log(
+          `[recv] group mention gate chat=${chatId} msg=${messageId} matched=${mentionCheck.matched} reason=${mentionCheck.reason} bot_open=${this.bot?.id || '-'} bot_app=${this.appId || '-'} detail=${mentionCheck.detail}`,
+          mentionCheck.matched ? 'info' : 'warn',
+        );
+        if (!mentionCheck.matched) {
+          this._log(`[recv] skipped group message=${messageId}: bot mention not matched`, 'warn');
+          return;
+        }
       }
     }
 
-    const parentId = typeof msg.parent_id === 'string' && msg.parent_id ? msg.parent_id : null;
-    const ctx = this._makeCtx(chatId, messageId, from, chatType, event, parentId);
+    const ctx = this._makeCtx(chatId, messageId, from, chatType, event, parentId, threadId, rootId);
 
     let text = '';
     const files: string[] = [];
@@ -529,6 +588,10 @@ class FeishuChannel extends Channel {
     }
 
     const trimmedText = text.trim();
+    this._log(
+      `[recv] parsed chat=${chatId} msg=${messageId} text_chars=${trimmedText.length} files=${files.length} thread=${threadId || '-'} root=${rootId || '-'} reply_to=${parentId || '-'} command=${trimmedText.startsWith('/')}`,
+      'info',
+    );
 
     const key = chatId;
     const prev = this.messageChains.get(key) || Promise.resolve();
@@ -537,12 +600,17 @@ class FeishuChannel extends Channel {
         const spaceIdx = trimmedText.indexOf(' ');
         const cmd = (spaceIdx > 0 ? trimmedText.slice(1, spaceIdx) : trimmedText.slice(1)).toLowerCase();
         const args = spaceIdx > 0 ? trimmedText.slice(spaceIdx + 1).trim() : '';
+        this._log(`[recv] dispatch command chat=${chatId} msg=${messageId} cmd=${cmd}`, 'info');
         await this._hCommand(cmd, args, ctx);
         return;
       }
 
       if (!this._hMessage) return;
       if (!trimmedText && !files.length) return;
+      this._log(
+        `[recv] dispatch message chat=${chatId} msg=${messageId} text_chars=${trimmedText.length} files=${files.length} thread=${threadId || '-'} root=${rootId || '-'} reply_to=${parentId || '-'}`,
+        'info',
+      );
       await this._hMessage({ text: trimmedText, files }, ctx);
     });
     const settled = current.catch(e => {
@@ -663,20 +731,21 @@ class FeishuChannel extends Channel {
     const view: FeishuCardView = { markdown: text.trim() || '(empty)', rows };
 
     if (opts.replyTo) {
-      return await this.replyCard(String(opts.replyTo), view);
+      return await this.replyCard(String(opts.replyTo), view, opts.replyInThread);
     }
 
     return await this.sendCard(chatId, view);
   }
 
-  async replyCard(replyToMsgId: string, view: FeishuCardView): Promise<string | null> {
+  async replyCard(replyToMsgId: string, view: FeishuCardView, replyInThread?: boolean): Promise<string | null> {
     const card = buildCardFromView(view);
-    this._logOutgoing('reply', `reply_to=${replyToMsgId} chars=${view.markdown.length} rows=${view.rows?.length || 0}`);
+    this._logOutgoing('reply', `reply_to=${replyToMsgId} in_thread=${!!replyInThread} chars=${view.markdown.length} rows=${view.rows?.length || 0}`);
     const resp = await this.client.im.message.reply({
       path: { message_id: replyToMsgId },
       data: {
         msg_type: 'interactive',
         content: JSON.stringify(card),
+        ...(replyInThread ? { reply_in_thread: true } : {})
       },
     });
     return requireMessageId(resp, 'reply interactive card');
@@ -869,13 +938,24 @@ class FeishuChannel extends Channel {
     return localPath;
   }
 
-  private _makeCtx(chatId: string, messageId: string, from: FeishuFrom, chatType: 'p2p' | 'group', raw: any, replyToMessageId?: string | null): FeishuContext {
+  private _makeCtx(
+    chatId: string,
+    messageId: string,
+    from: FeishuFrom,
+    chatType: 'p2p' | 'group',
+    raw: any,
+    replyToMessageId?: string | null,
+    threadId?: string | null,
+    rootMessageId?: string | null,
+  ): FeishuContext {
     return {
       chatId,
       messageId,
       from,
       chatType,
       replyToMessageId: replyToMessageId || null,
+      threadId: threadId || null,
+      rootMessageId: rootMessageId || null,
       reply: (text: string, opts?: SendOpts) => this.send(chatId, text, { ...opts, replyTo: messageId || opts?.replyTo }),
       editReply: (msgId: string, text: string, opts?: SendOpts) => this.editMessage(chatId, msgId, text, opts),
       channel: this,
@@ -893,13 +973,65 @@ class FeishuChannel extends Channel {
     try { recordKnownChatId('feishu', chatId); } catch {}
   }
 
-  private _isBotMentioned(msg: any): boolean {
+  // [中文注释] 飞书群聊 @ 机器人时，事件里的 mention 既可能带 open_id，也可能带 app_id。
+  // 这里统一收集多种身份字段，避免在最前置的 mention gate 上误丢消息。
+  private _inspectBotMention(msg: any): { matched: boolean; reason: string; detail: string } {
     const mentions: any[] = msg.mentions || [];
-    if (!this.bot) return mentions.length > 0;
-    return mentions.some((m: any) => {
-      const mentionId = m.id?.open_id || m.id?.app_id || '';
-      return mentionId === this.bot!.id || m.name === this.bot!.displayName;
-    });
+    if (!mentions.length) return { matched: false, reason: 'no-mentions', detail: '[]' };
+    if (!this.bot) return { matched: true, reason: 'bot-unresolved-has-mentions', detail: this._describeMentions(mentions) };
+
+    const botIdCandidates = new Set(
+      [this.bot?.id, this.appId]
+        .map(normalizeIdentityValue)
+        .filter(Boolean),
+    );
+    const botNameCandidates = new Set(
+      [this.bot?.displayName, this.bot?.username]
+        .map(normalizeIdentityValue)
+        .filter(Boolean),
+    );
+
+    for (const mention of mentions) {
+      const mentionIds = [
+        mention?.id?.open_id,
+        mention?.id?.app_id,
+        mention?.id?.user_id,
+        mention?.id?.union_id,
+        mention?.open_id,
+        mention?.app_id,
+        mention?.user_id,
+        mention?.union_id,
+      ]
+        .map(normalizeIdentityValue)
+        .filter(Boolean);
+      const mentionName = normalizeIdentityValue(mention?.name);
+
+      if (mentionIds.some(id => botIdCandidates.has(id))) {
+        return { matched: true, reason: 'id-match', detail: this._describeMentions(mentions) };
+      }
+      if (mentionName && botNameCandidates.has(mentionName)) {
+        return { matched: true, reason: 'name-match', detail: this._describeMentions(mentions) };
+      }
+    }
+
+    return { matched: false, reason: 'no-bot-match', detail: this._describeMentions(mentions) };
+  }
+
+  private _describeMentions(mentions: any[]): string {
+    if (!Array.isArray(mentions) || mentions.length === 0) return '[]';
+    return mentions
+      .map((mention: any) => {
+        const ids = [
+          mention?.id?.open_id && `open:${mention.id.open_id}`,
+          mention?.id?.app_id && `app:${mention.id.app_id}`,
+          mention?.id?.user_id && `user:${mention.id.user_id}`,
+          mention?.id?.union_id && `union:${mention.id.union_id}`,
+        ].filter(Boolean).join(',');
+        const name = String(mention?.name || '').trim() || '-';
+        const key = String(mention?.key || '').trim() || '-';
+        return `{key=${key};name=${name};ids=${ids || '-'}}`;
+      })
+      .join(';');
   }
 
   private _cleanMention(text: string): string {

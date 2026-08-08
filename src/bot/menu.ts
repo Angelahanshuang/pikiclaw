@@ -11,8 +11,8 @@ export interface WelcomeIntro {
 
 export function buildWelcomeIntro(version: string): WelcomeIntro {
   return {
-    title: "Hi, I'm pikiloom",
-    subtitle: 'Send me a message to get started.',
+    title: "Hello，我是pikiloom",
+    subtitle: '给我发消息以开始使用。',
     version,
   };
 }
@@ -36,36 +36,37 @@ export function indexSkillsByCommand(skills: SkillInfo[]): Map<string, SkillInfo
 }
 
 export function buildDefaultMenuCommands(agentCount: number, skills: SkillInfo[] = []): MenuCommand[] {
+  // 默认菜单命令：description 用于启动通知与 /start 的展示文案，统一使用中文 202608081529
   const commands: MenuCommand[] = [
-    { command: 'sessions', description: 'Switch sessions' },
-    { command: 'digest', description: 'Recent session digest' },
+    { command: 'sessions', description: '切换会话' },
+    { command: 'digest', description: '最近会话摘要' },
   ];
 
   if (agentCount > 1) {
-    commands.push({ command: 'agents', description: 'Switch agents' });
+    commands.push({ command: 'agents', description: '切换 Agent' });
   }
 
   commands.push(
-    { command: 'switch', description: 'Change workdir' },
-    { command: 'workspaces', description: 'Pick saved workspace' },
-    { command: 'models', description: 'Switch models' },
-    { command: 'mode', description: 'Toggle plan mode' },
-    { command: 'goal', description: 'Set/inspect a persistent goal' },
-    { command: 'stop', description: 'Stop current session' },
-    { command: 'status', description: 'Show status' },
-    { command: 'host', description: 'Host info' },
+    { command: 'switch', description: '切换工作目录' },
+    { command: 'workspaces', description: '选择已保存的工作区' },
+    { command: 'models', description: '切换模型' },
+    { command: 'mode', description: '切换为计划模式' },
+    { command: 'goal', description: '设置/查看长期运行任务' },
+    { command: 'stop', description: '停止当前会话' },
+    { command: 'status', description: '查看状态' },
+    { command: 'host', description: '查看服务器信息' },
   );
 
   if (skills.length) {
-    commands.push({ command: 'skills', description: 'Browse skills' });
+    commands.push({ command: 'skills', description: '浏览已安装技能skills' });
   }
 
-  commands.push({ command: 'ext', description: 'Extensions overview' });
+  commands.push({ command: 'ext', description: '扩展概览' });
 
   if (agentCount === 1) {
-    commands.push({ command: 'agents', description: 'Switch agents' });
+    commands.push({ command: 'agents', description: '切换 Agent' });
   }
 
-  commands.push({ command: 'restart', description: 'Restart bot' });
+  commands.push({ command: 'restart', description: '重启机器人' });
   return commands;
 }

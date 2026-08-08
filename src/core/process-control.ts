@@ -110,6 +110,17 @@ export function ensureNonInteractiveRestartArgs(bin: string, args: string[]): st
   return ['--yes', ...args];
 }
 
+// 解析 npm 全局安装产生的 bin 软链，得到真实的入口文件（如 dist/cli/main.js）。
+// 通过软链（如 ~/.npm-global/bin/pikiloom）启动时，process.argv[1] 是不带 .js 的软链路径，
+// 若直接用它判断“是否本地入口”会失配，导致 daemon 回退到 npx pikiloom@latest 拉线上版本。202608081413
+function resolveRealEntry(argv1: string): string | null {
+  try {
+    return fs.realpathSync(argv1);
+  } catch {
+    return null;
+  }
+}
+
 export function getDefaultRestartCmd(): string {
   const argv0 = process.argv[0] ?? '';
   const argv1 = process.argv[1] ?? '';
@@ -119,10 +130,13 @@ export function getDefaultRestartCmd(): string {
     const parts = isTsxLoader ? ['tsx', argv1] : process.argv.slice(0, 2);
     return parts.map(arg => arg.includes(' ') ? `"${arg}"` : arg).join(' ');
   }
-  if (argv1.endsWith('.js') && (argv1.includes('pikiloom') || argv1.includes('pikiloom'))) {
+  // 优先用 realpath 解析后的真实入口（软链场景下带 .js 后缀，可命中本地入口分支）。
+  const realEntry = resolveRealEntry(argv1);
+  const entry = realEntry && realEntry.includes('pikiloom') ? realEntry : argv1;
+  if (entry.endsWith('.js') && entry.includes('pikiloom')) {
     const nodeBin = argv0.includes(' ') ? `"${argv0}"` : argv0;
-    const entry = argv1.includes(' ') ? `"${argv1}"` : argv1;
-    return `${nodeBin} ${entry}`;
+    const safeEntry = entry.includes(' ') ? `"${entry}"` : entry;
+    return `${nodeBin} ${safeEntry}`;
   }
   return 'npx --yes pikiloom@latest';
 }
